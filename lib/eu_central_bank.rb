@@ -7,6 +7,8 @@ class InvalidCache < StandardError ; end
 
 class CurrencyUnavailable < StandardError; end
 
+class InvalidStorageType < StandardError; end
+
 class EuCentralBank < Money::Bank::VariableExchange
 
   attr_accessor :last_updated
@@ -20,8 +22,12 @@ class EuCentralBank < Money::Bank::VariableExchange
   ECB_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'.freeze
   ECB_90_DAY_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml'.freeze
 
-  def initialize(st = Money::RatesStore::StoreWithHistoricalDataSupport.new, &block)
-    super
+  def initialize(options = {}, &block)
+    st = options[:st] || Money::RatesStore::StoreWithHistoricalDataSupport.new
+    super(st, &block)
+    @options = options
+    @storage_type = options[:storage_type] || :file
+    @redis_client =  options[:redis_client] if storage_type == :redis
     @currency_string = nil
   end
 
@@ -35,9 +41,16 @@ class EuCentralBank < Money::Bank::VariableExchange
 
   def save_rates(cache, url=ECB_RATES_URL)
     raise InvalidCache unless cache
-    File.open(cache, "w") do |file|
-      io = open(url);
-      io.each_line { |line| file.puts line }
+    io = open(url)
+    case storage_type
+    when :file
+      File.open(cache, "w") do |file|
+        io.each_line { |line| file.puts line }
+      end
+    when :redis
+      redis_client.set(cache, io.string)
+    else
+      raise InvalidStorageType, storage_type
     end
   end
 
@@ -108,17 +121,17 @@ class EuCentralBank < Money::Bank::VariableExchange
 
   def export_rates(format, file = nil, opts = {})
     raise Money::Bank::UnknownRateFormat unless
-      RATE_FORMATS.include? format
+        RATE_FORMATS.include? format
 
     store.transaction true do
       s = case format
-      when :json
-        JSON.dump(rates)
-      when :ruby
-        Marshal.dump(rates)
-      when :yaml
-        YAML.dump(rates)
-      end
+          when :json
+            JSON.dump(rates)
+          when :ruby
+            Marshal.dump(rates)
+          when :yaml
+            YAML.dump(rates)
+          end
 
       unless file.nil?
         File.open(file, "w") {|f| f.write(s) }
@@ -130,17 +143,17 @@ class EuCentralBank < Money::Bank::VariableExchange
 
   def import_rates(format, s, opts = {})
     raise Money::Bank::UnknownRateFormat unless
-      RATE_FORMATS.include? format
+        RATE_FORMATS.include? format
 
     store.transaction true do
       data = case format
-       when :json
-         JSON.load(s)
-       when :ruby
-         Marshal.load(s)
-       when :yaml
-         YAML.load(s)
-       end
+             when :json
+               JSON.load(s)
+             when :ruby
+               Marshal.load(s)
+             when :yaml
+               YAML.load(s)
+             end
 
       data.each do |key, rate|
         from, to = key.split(SERIALIZER_SEPARATOR)
@@ -164,7 +177,14 @@ class EuCentralBank < Money::Bank::VariableExchange
 
   def doc(cache, url=ECB_RATES_URL)
     rates_source = !!cache ? cache : url
-    Nokogiri::XML(open(rates_source)).tap { |doc| doc.xpath('gesmes:Envelope/xmlns:Cube/xmlns:Cube//xmlns:Cube') }
+
+    xml = if storage_type == :redis
+            redis_client.get(cache)
+          else
+            open(rates_source)
+          end
+
+    Nokogiri::XML(xml).tap { |doc| doc.xpath('gesmes:Envelope/xmlns:Cube/xmlns:Cube//xmlns:Cube') }
   rescue Nokogiri::XML::XPath::SyntaxError
     Nokogiri::XML(open(url))
   end
@@ -210,6 +230,8 @@ class EuCentralBank < Money::Bank::VariableExchange
   end
 
   private
+
+  attr_reader :options, :storage_type, :redis_client
 
   def calculate_exchange(from, to_currency, rate)
     to_currency_money = Money::Currency.wrap(to_currency).subunit_to_unit
